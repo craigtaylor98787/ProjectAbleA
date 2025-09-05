@@ -1,52 +1,44 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-Able101 — Fixtures + Stats Ingestion (API-Football ? SQLite)
-- Respects existing 'fixtures' schema (already on Able101).
-- Simple top-of-file config; "override by commenting out" style for leagues/window.
-- Two modes:
-    A) Historical by explicit SEASONS (e.g., [2021, 2022, 2023])
-    B) Rolling window by last X DAYS (e.g., last 7 days) for recently completed fixtures
-- Fetches fixtures list, then for each FINISHED fixture also fetches statistics.
-- Deduce columns not present directly (home_win/draw/away_win, over_1_5/over_2_5, btts).
-- Rate limit (requests/sec) and daily cap guard.
-- Prints fixture details to stdout (handy for manual runs).
-- Emails a concise summary on completion.
+Able101 Fixtures + Stats Ingestion (API-Football -> SQLite)
 
-USAGE (manual):
-    python able101/src/01_ingest_fixtures.py
+- Respects existing 'fixtures' schema (no DDL).
+- Simple top-of-file config with comment-to-switch modes.
+- Two modes:
+  A) Historical by explicit SEASONS (e.g., [2023])
+  B) Rolling window by LAST_X_DAYS (e.g., 7)
+- Pull fixtures; for finished fixtures also pull statistics.
+- Deduce home_win/draw/away_win, over_1_5/over_2_5, btts.
+- Rate limit and daily cap guards.
+- Prints each processed fixture; emails a concise summary on completion.
 """
 
 # --- CONFIG (EDIT ME) -------------------------------------------------------
 
 # Paths
 DB_PATH = "/mnt/able101_usb/database/able101.sqlite"
-ENV_PATH = "/home/zentr/ProjectAbleA/able101/config/.env"                 # contains API key + email creds
+ENV_PATH = "/home/zentr/ProjectAbleA/able101/config/.env"  # contains API key + email creds
 LEAGUE_ALLOWLIST_PATH = "/mnt/able101_usb/config/league_allowlist.txt"
 
-# League selection:
-USE_ALLOWLIST = False   # default: read leagues from allow-list file
-# To override with explicit leagues, set USE_ALLOWLIST = False and list them below:
-OVERRIDE_LEAGUES = [364]   # example: EPL=39; comment out this line OR set USE_ALLOWLIST=True to revert
+# League selection
+USE_ALLOWLIST = False      # True = read leagues from allow-list file below
+# To override with explicit leagues, set USE_ALLOWLIST = False and list them here:
+OVERRIDE_LEAGUES = [364]    # e.g., [39]
 
-# Ingestion window (choose ONE block by commenting the other)
-# Option A) Historical ingestion: explicit seasons (e.g., [2021, 2022, 2023])
+# Ingestion window (choose exactly one mode)
+# Option A) Historical seasons
 USE_SEASONS_MODE = True
-SEASONS = [2023]  # used only if USE_SEASONS_MODE = True
+SEASONS = [2023]          # used only if USE_SEASONS_MODE = True
 
-# Option B) Rolling window: last X days (e.g., last 7 days). Pulls fixtures by date range.
+# Option B) Rolling window by days
 USE_LAST_X_DAYS_MODE = False
-LAST_X_DAYS = 7   # used only if USE_LAST_X_DAYS_MODE = True
+LAST_X_DAYS = 7
 
-# API pacing
-REQUESTS_PER_SECOND = 6     # <= 1.0 rps is polite
-DAILY_REQUEST_CAP = 75000       # hard stop within this run (simple guard)
+# API pacing (set to your plan; you said 6 rps)
+REQUESTS_PER_SECOND = 6.0
+DAILY_REQUEST_CAP = 70000
 
-# Logging / printing detail
+# Logging / email
 PRINT_EACH_FIXTURE = True
-
-# Email summary
 SEND_EMAIL = True
 
 # ---------------------------------------------------------------------------
@@ -59,7 +51,6 @@ import sqlite3
 import smtplib
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
-
 import urllib.request
 import urllib.parse
 
@@ -121,12 +112,10 @@ class APIFootballClient:
             data = resp.read()
         return json.loads(data.decode("utf-8"))
 
-    # Fixtures by league/season
     def fixtures_by_league_season(self, league: int, season: int) -> list:
         data = self._get("/fixtures", {"league": league, "season": season})
         return data.get("response", [])
 
-    # Fixtures by date range (YYYY-MM-DD)
     def fixtures_by_date_range(self, date_from: str, date_to: str, league: int = None) -> list:
         params = {"from": date_from, "to": date_to}
         if league:
@@ -134,7 +123,6 @@ class APIFootballClient:
         data = self._get("/fixtures", params)
         return data.get("response", [])
 
-    # Statistics per fixture (fills many schema fields)
     def fixture_statistics(self, fixture_id: int) -> list:
         data = self._get("/fixtures/statistics", {"fixture": fixture_id})
         return data.get("response", [])
@@ -148,53 +136,51 @@ def connect_db(path: str) -> sqlite3.Connection:
     return con
 
 def ensure_fixtures_table(con: sqlite3.Connection):
-    # Respect existing schema; DO NOT drop/recreate.
-    # We assume the table exists as per project requirements.
-    # Optional: sanity check for a few columns:
-    cols = dict(con.execute("PRAGMA table_info(fixtures)").fetchall())
-    # Not enforcing here; trusting canonical schema is already present.
+    """Verify the canonical fixtures table exists; do not mutate schema."""
+    row = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='fixtures'"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(
+            "fixtures table not found at DB_PATH; create it first (we never auto-create)."
+        )
 
 def upsert_fixture(con: sqlite3.Connection, row: dict):
-    # Build INSERT ... ON CONFLICT DO UPDATE for all columns
-    columns = list(row.keys())
-    placeholders = ",".join([":" + c for c in columns])
-    col_list = ",".join(columns)
-    update_clause = ",".join([f"{c}=excluded.{c}" for c in columns if c != "fixture_id"])
-    sql = f"""
-    INSERT INTO fixtures ({col_list})
-    VALUES ({placeholders})
-    ON CONFLICT(fixture_id) DO UPDATE SET
-    {update_clause};
-    """
-    con.execute(sql, row)
+    """INSERT or UPDATE a fixture row, quoting identifiers for columns like home_passes_%."""
+    cols = list(row.keys())
+    def qcol(c: str) -> str:
+        return '"' + c.replace('"', '""') + '"'
+    col_list = ", ".join(qcol(c) for c in cols)
+    placeholders = ", ".join("?" for _ in cols)
+    values = tuple(row[c] for c in cols)
+    update_clause = ", ".join(f"{qcol(c)}=excluded.{qcol(c)}"
+                              for c in cols if c != "fixture_id")
+    sql = (
+        f'INSERT INTO fixtures ({col_list}) VALUES ({placeholders}) '
+        f'ON CONFLICT("fixture_id") DO UPDATE SET {update_clause};'
+    )
+    con.execute(sql, values)
 
 # --- Stats extraction helpers ----------------------------------------------
 
 def _val(stats, team: str, name: str):
     """Extract value by team ('home'|'away') and stat name from /fixtures/statistics response."""
-    # API returns list with two entries: one per team, each has "team":{"name":...} and "statistics":[{"type":..., "value":...}]
     if not stats:
         return None
-    side = None
-    for entry in stats:
-        t = entry.get("team", {}).get("name", "") or ""
-        # Heuristic: the first entry is home, second is away in fixtures; but safer is to match by team names if available.
-        # We'll pick by order: 0->home, 1->away if names not helping.
-    # Order map:
     idx = 0 if team == "home" else 1
     if idx < len(stats):
         items = stats[idx].get("statistics", [])
         for it in items:
-            if (it.get("type") or "").lower() == name.lower():
+            t = (it.get("type") or "")
+            if t.lower() == name.lower():
                 val = it.get("value")
                 if isinstance(val, str) and val.endswith("%"):
                     try:
                         return float(val.strip("%"))
-                    except:
+                    except Exception:
                         return None
                 if isinstance(val, (int, float)):
                     return float(val)
-                # Some are None
                 return None
     return None
 
@@ -211,14 +197,10 @@ def deduce_outcomes(home_score, away_score):
     return (home_win, draw, away_win, over_1_5, over_2_5, btts)
 
 def parse_stats_to_row(stats, base):
-    """Fill the many *_shots_*, *_cards, possession, passes, corners, etc."""
-    row = dict(base)  # start with base (fixture basics)
-
-    # Possession (% already normalized to float 0..100)
+    row = dict(base)
     row["home_ball_possession"] = _val(stats, "home", "Ball Possession")
     row["away_ball_possession"] = _val(stats, "away", "Ball Possession")
 
-    # Shots
     row["home_shots_on_goal"]   = _val(stats, "home", "Shots on Goal")
     row["home_shots_off_goal"]  = _val(stats, "home", "Shots off Goal")
     row["home_total_shots"]     = _val(stats, "home", "Total Shots")
@@ -233,7 +215,6 @@ def parse_stats_to_row(stats, base):
     row["away_shots_insidebox"] = _val(stats, "away", "Shots insidebox")
     row["away_shots_outsidebox"]= _val(stats, "away", "Shots outsidebox")
 
-    # Fouls, Offsides, Corners
     row["home_fouls"]           = _val(stats, "home", "Fouls")
     row["home_offsides"]        = _val(stats, "home", "Offsides")
     row["home_corner_kicks"]    = _val(stats, "home", "Corner Kicks")
@@ -242,7 +223,6 @@ def parse_stats_to_row(stats, base):
     row["away_offsides"]        = _val(stats, "away", "Offsides")
     row["away_corner_kicks"]    = _val(stats, "away", "Corner Kicks")
 
-    # Cards & saves
     row["home_yellow_cards"]    = _val(stats, "home", "Yellow Cards")
     row["home_red_cards"]       = _val(stats, "home", "Red Cards")
     row["home_goalkeeper_saves"]= _val(stats, "home", "Goalkeeper Saves")
@@ -251,7 +231,6 @@ def parse_stats_to_row(stats, base):
     row["away_red_cards"]       = _val(stats, "away", "Red Cards")
     row["away_goalkeeper_saves"]= _val(stats, "away", "Goalkeeper Saves")
 
-    # Passing
     row["home_total_passes"]    = _val(stats, "home", "Total passes")
     row["home_passes_accurate"] = _val(stats, "home", "Passes accurate")
     row["home_passes_%"]        = _val(stats, "home", "Passes %")
@@ -276,7 +255,7 @@ def load_league_allowlist(path: str) -> list:
                 continue
             try:
                 leagues.append(int(s))
-            except:
+            except Exception:
                 print(f"[WARN] Skipping invalid league id in allow-list: {s}")
     return leagues
 
@@ -296,20 +275,17 @@ def send_email_summary(env: dict, subject: str, body: str):
         s.login(env["SMTP_USER"], env["SMTP_PASS"])
         s.send_message(msg)
 
-# --- Main ingestion ---------------------------------------------------------
+# --- Row builder ------------------------------------------------------------
 
 def fixture_row_base(fix: dict):
-    # Extract common fields from /fixtures
     f = fix.get("fixture", {})
     t = fix.get("teams", {})
     g = fix.get("goals", {})
     l = fix.get("league", {})
-    s = fix.get("score", {})
 
     fixture_id = f.get("id")
-    date_iso = f.get("date")      # e.g., "2023-10-01T14:00:00+00:00"
-    # Store as TEXT ISO8601 w/ timezone kept as-is
-    status_short = f.get("status", {}).get("short")  # "FT", "NS", etc.
+    date_iso = f.get("date")
+    status_short = f.get("status", {}).get("short")
 
     league_id = l.get("id")
     season = l.get("season")
@@ -341,7 +317,6 @@ def fixture_row_base(fix: dict):
         "over_1_5": over_1_5,
         "over_2_5": over_2_5,
         "btts": btts,
-        # stats fields will be added later (many NULLs initially)
         "home_shots_on_goal": None,
         "home_shots_off_goal": None,
         "home_total_shots": None,
@@ -378,6 +353,8 @@ def fixture_row_base(fix: dict):
     }
     return row, status_short
 
+# --- Main -------------------------------------------------------------------
+
 def main():
     start_ts = time.time()
     env = load_env(ENV_PATH)
@@ -386,7 +363,6 @@ def main():
         print(f"[ERROR] APIFOOTBALL_KEY not found in {ENV_PATH}")
         sys.exit(1)
 
-    # Leagues to process
     if USE_ALLOWLIST:
         leagues = load_league_allowlist(LEAGUE_ALLOWLIST_PATH)
     else:
@@ -395,7 +371,6 @@ def main():
         print("[WARN] No leagues configured. Exiting.")
         return
 
-    # Window selection
     today = datetime.utcnow().date()
     if USE_SEASONS_MODE and not USE_LAST_X_DAYS_MODE:
         seasons = list(SEASONS or [])
@@ -407,7 +382,7 @@ def main():
         date_to = today
         date_from = today - timedelta(days=int(LAST_X_DAYS))
         seasons = None
-        mode_desc = f"Last {LAST_X_DAYS} days ({date_from} ? {date_to})"
+        mode_desc = f"Last {LAST_X_DAYS} days ({date_from} -> {date_to})"
     else:
         print("[ERROR] Configure exactly one mode: SEASONS or LAST_X_DAYS.")
         sys.exit(2)
@@ -418,44 +393,36 @@ def main():
     con = connect_db(DB_PATH)
     ensure_fixtures_table(con)
 
-    totals = {
-        "inserted": 0,
-        "updated": 0,
-        "skipped": 0,
-        "per_league": {}
-    }
-
+    totals = {"inserted": 0, "updated": 0, "skipped": 0, "per_league": {}}
     def bump_league(league_id, key):
         d = totals["per_league"].setdefault(league_id, {"inserted":0,"updated":0,"skipped":0})
         d[key] += 1
+
+    error_text = None
 
     try:
         for league_id in leagues:
             print(f"\n=== League {league_id} | Mode: {mode_desc} ===")
             if seasons:
-                # Historical
                 fixtures = []
                 for season in seasons:
                     print(f"Fetching fixtures for league={league_id} season={season} ...")
                     fixtures += api.fixtures_by_league_season(league_id, season)
             else:
-                # Rolling window; API supports from/to, optionally by league
                 date_to = today
                 date_from = today - timedelta(days=int(LAST_X_DAYS))
-                print(f"Fetching fixtures for league={league_id} {date_from}?{date_to} ...")
+                print(f"Fetching fixtures for league={league_id} {date_from}->{date_to} ...")
                 fixtures = api.fixtures_by_date_range(date_from.isoformat(), date_to.isoformat(), league=league_id)
 
             for fix in fixtures:
                 base_row, status_short = fixture_row_base(fix)
                 fid = base_row["fixture_id"]
 
-                # fetch stats only for finished matches ("FT" or "AET" etc.)
                 stats_row = dict(base_row)
                 if status_short in ("FT", "AET", "PEN"):
                     stats = api.fixture_statistics(fid)
                     stats_row = parse_stats_to_row(stats, base_row)
 
-                # Detect insert vs update by checking existing
                 cur = con.execute("SELECT last_updated FROM fixtures WHERE fixture_id=?", (fid,)).fetchone()
                 if cur is None:
                     upsert_fixture(con, stats_row)
@@ -475,18 +442,13 @@ def main():
                           f"{stats_row['home_team']} {hs}-{as_} {stats_row['away_team']} | status={status_short}")
 
             con.commit()
-
     except Exception as e:
-        print(f"[ERROR] {e}")
-        # We'll include error in email too
         error_text = str(e)
-    else:
-        error_text = None
+        print(f"[ERROR] {error_text}")
     finally:
         con.commit()
         con.close()
 
-    # Compose summary
     dur = time.time() - start_ts
     per_league_lines = []
     for lid, counts in sorted(totals["per_league"].items()):
