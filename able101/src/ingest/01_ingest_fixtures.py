@@ -53,6 +53,8 @@ from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 import urllib.request
 import urllib.parse
+import socket
+import random
 
 # --- Helper: read .env ------------------------------------------------------
 
@@ -420,8 +422,14 @@ def main():
 
                 stats_row = dict(base_row)
                 if status_short in ("FT", "AET", "PEN"):
-                    stats = api.fixture_statistics(fid)
-                    stats_row = parse_stats_to_row(stats, base_row)
+                    try:
+                        stats = api.fixture_statistics(fid)
+                        stats_row = parse_stats_to_row(stats, base_row)
+                    except Exception as e:
+                        print(f"[WARN] Stats fetch failed for fixture {fid}: {e}")
+                        # keep base_row (no stats) and continue
+                        totals["skipped"] += 1
+                        bump_league(league_id, "skipped")
 
                 cur = con.execute("SELECT last_updated FROM fixtures WHERE fixture_id=?", (fid,)).fetchone()
                 if cur is None:
