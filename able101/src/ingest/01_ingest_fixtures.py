@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
 Able101 Fixtures + Stats Ingestion (API-Football -> SQLite)
 
@@ -19,10 +22,6 @@ DB_PATH = "/mnt/able101_usb/database/able101.sqlite"
 ENV_PATH = "/home/zentr/ProjectAbleA/able101/config/.env"  # contains API key + email creds
 LEAGUE_ALLOWLIST_PATH = "/mnt/able101_usb/config/league_allowlist.txt"
 
-# --- Enrichment toggles ---
-FETCH_STATS   = True   # /fixtures/statistics
-FETCH_LINEUPS = False   # /fixtures/lineups
-
 # League selection
 USE_ALLOWLIST = False      # True = read leagues from allow-list file below
 # To override with explicit leagues, set USE_ALLOWLIST = False and list them here:
@@ -31,7 +30,7 @@ OVERRIDE_LEAGUES = [365]    # e.g., [39]
 # Ingestion window (choose exactly one mode)
 # Option A) Historical seasons
 USE_SEASONS_MODE = True
-SEASONS = [2015, 2016, 2017, 2018, 2019, 2020]          # used only if USE_SEASONS_MODE = True
+SEASONS = [2024]          # used only if USE_SEASONS_MODE = True
 
 # Option B) Rolling window by days
 USE_LAST_X_DAYS_MODE = False
@@ -57,11 +56,6 @@ from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 import urllib.request
 import urllib.parse
-import socket
-import random
-import re
-from urllib.request import Request, urlopen
-from urllib.parse import urlencode
 
 # --- Helper: read .env ------------------------------------------------------
 
@@ -250,166 +244,6 @@ def parse_stats_to_row(stats, base):
 
     return row
 
-# === NEW: stats + lineups enrichment helpers ==============================
-
-def _api_get_json(path: str, params: dict, *, api_key: str, timeout: int = 30):
-    """
-    Minimal, self-contained GET for API-Football.
-    Uses the same key as your main script; no other globals required.
-    """
-    base = "https://v3.football.api-sports.io/"
-    url = base + path
-    if params:
-        url += "?" + urlencode(params)
-    req = Request(url, headers={"x-apisports-key": api_key})
-    with urlopen(req, timeout=timeout) as resp:
-        import json
-        return json.loads(resp.read().decode("utf-8"))
-
-def _norm(s: str) -> str:
-    # normalize API stat labels like "Shots insidebox", "Passes %", "Ball Possession"
-    return re.sub(r"[^a-z0-9]+", "", s.lower())
-
-# map normalized API stat label -> schema suffix
-_STAT_MAP = {
-    "shotsongoal":        "shots_on_target",
-    "shotsoffgoal":       "shots_off_target",
-    "totalshots":         "shots_total",
-    "blockedshots":       "shots_blocked",
-    "shotsinsidebox":     "shots_in_box",
-    "shotsoutsidebox":    "shots_out_box",
-    "fouls":              "fouls",
-    "cornerkicks":        "corners",
-    "offsides":           "offsides",
-    "ballpossession":     "possession_%",
-    "yellowcards":        "yellow_cards",
-    "redcards":           "red_cards",
-    "goalkeepersaves":    "saves",
-    "totalpasses":        "passes_total",
-    "passesaccurate":     "passes_accurate",
-    "passes":             "passes_total",     # safety alias if some feeds send "Passes"
-    "passespercentage":   "passes_%",         # safety alias
-    "passes%":            "passes_%",         # safety alias
-}
-
-def _coerce_stat_value(val):
-    if val is None:
-        return None
-    if isinstance(val, (int, float)):
-        return val
-    s = str(val).strip()
-    if s.endswith("%"):
-        s = s[:-1]
-    if s == "" or s.lower() == "null":
-        return None
-    # try int, then float
-    try:
-        return int(s)
-    except ValueError:
-        try:
-            return float(s)
-        except ValueError:
-            return None
-
-def _side_for_team(row: dict, team_obj: dict) -> str | None:
-    """
-    Decide 'home' or 'away' for a stats/lineup team.
-    Uses ids if present; falls back to names.
-    """
-    tid = (team_obj or {}).get("id")
-    tname = (team_obj or {}).get("name")
-    if tid is not None:
-        if "home_team_id" in row and row["home_team_id"] == tid: return "home"
-        if "away_team_id" in row and row["away_team_id"] == tid: return "away"
-    if tname:
-        if "home_team" in row and row["home_team"] == tname: return "home"
-        if "away_team" in row and row["away_team"] == tname: return "away"
-        if "home_team_name" in row and row["home_team_name"] == tname: return "home"
-        if "away_team_name" in row and row["away_team_name"] == tname: return "away"
-    return None
-
-def _existing_fixture_columns(con) -> set[str]:
-    cols = set()
-    for cid, name, ctype, notnull, dflt, pk in con.execute("PRAGMA table_info(fixtures)"):
-        cols.add(name)
-    return cols
-
-def enrich_fixture_row_with_stats_and_lineups(
-    con, row: dict, fixture_id: int, *, api_key: str,
-    fetch_stats: bool, fetch_lineups: bool, rps: float
-) -> tuple[dict, dict]:
-    """
-    Returns (row_updates, meta_counts)
-      - row_updates: keys you can .update(row) with
-      - meta_counts: {'stats': 0|1, 'lineups': 0|1} for summary accounting
-    Respects the actual DB columns: only emits keys that exist in fixtures.
-    """
-    import time
-    updates: dict = {}
-    meta = {"stats": 0, "lineups": 0}
-    existing = _existing_fixture_columns(con)
-
-    def throttle():
-        # very light throttle to respect your configured Requests Per Second
-        if rps and rps > 0:
-            time.sleep(1.0 / float(rps))
-
-    # --- STATS ---
-    if fetch_stats:
-        try:
-            throttle()
-            data = _api_get_json("fixtures/statistics", {"fixture": fixture_id}, api_key=api_key)
-            items = (data or {}).get("response") or []
-            side_buckets = {"home": {}, "away": {}}
-            for entry in items:
-                side = _side_for_team(row, entry.get("team", {}))
-                if side not in ("home", "away"):
-                    continue
-                for stat in entry.get("statistics", []) or []:
-                    label = _norm(stat.get("type", ""))
-                    val = _coerce_stat_value(stat.get("value"))
-                    if not label:
-                        continue
-                    key_suffix = _STAT_MAP.get(label)
-                    if not key_suffix:
-                        # unseen stat; skip silently (or log if you want)
-                        continue
-                    col_name = f"{side}_{key_suffix}"
-                    side_buckets[side][col_name] = val
-            # filter to known columns only (avoids SQL errors & drift)
-            for k, v in {**side_buckets["home"], **side_buckets["away"]}.items():
-                if k in existing:
-                    updates[k] = v
-            if updates:
-                meta["stats"] = 1
-        except Exception as e:
-            print(f"[WARN] stats fetch failed for fixture {fixture_id}: {e}")
-
-    # --- LINEUPS (formations & coaches) ---
-    if fetch_lineups:
-        try:
-            throttle()
-            data = _api_get_json("fixtures/lineups", {"fixture": fixture_id}, api_key=api_key)
-            items = (data or {}).get("response") or []
-            for entry in items:
-                side = _side_for_team(row, entry.get("team", {}))
-                if side not in ("home", "away"):
-                    continue
-                formation = (entry.get("formation") or "").strip() or None
-                coach = ((entry.get("coach") or {}).get("name") or "").strip() or None
-                k_form = f"{side}_formation"
-                k_coach = f"{side}_coach"
-                if k_form in existing:
-                    updates[k_form] = formation
-                if k_coach in existing:
-                    updates[k_coach] = coach
-            if any(k in updates for k in ("home_formation","away_formation","home_coach","away_coach")):
-                meta["lineups"] = 1
-        except Exception as e:
-            print(f"[WARN] lineups fetch failed for fixture {fixture_id}: {e}")
-
-    return updates, meta
-
 # --- Allow list -------------------------------------------------------------
 
 def load_league_allowlist(path: str) -> list:
@@ -522,23 +356,6 @@ def fixture_row_base(fix: dict):
     }
     return row, status_short
 
-# Enrich with stats & lineups (safe: only columns that exist in DB are emitted)
-extra, meta = enrich_fixture_row_with_stats_and_lineups(
-    con,
-    row,
-    fixture_id=row["fixture_id"],
-    api_key=API_KEY,               # reuse whatever var you already load from .env
-    fetch_stats=FETCH_STATS,
-    fetch_lineups=FETCH_LINEUPS,
-    rps=REQUESTS_PER_SECOND,       # your existing limit (you set this to 6)
-)
-row.update(extra)
-
-# (Optional) bump your run counters if you keep a summary dict:
-# run_counts["stats_hit"] += meta["stats"]
-# run_counts["lineups_hit"] += meta["lineups"]
-
-
 # --- Main -------------------------------------------------------------------
 
 def main():
@@ -606,14 +423,8 @@ def main():
 
                 stats_row = dict(base_row)
                 if status_short in ("FT", "AET", "PEN"):
-                    try:
-                        stats = api.fixture_statistics(fid)
-                        stats_row = parse_stats_to_row(stats, base_row)
-                    except Exception as e:
-                        print(f"[WARN] Stats fetch failed for fixture {fid}: {e}")
-                        # keep base_row (no stats) and continue
-                        totals["skipped"] += 1
-                        bump_league(league_id, "skipped")
+                    stats = api.fixture_statistics(fid)
+                    stats_row = parse_stats_to_row(stats, base_row)
 
                 cur = con.execute("SELECT last_updated FROM fixtures WHERE fixture_id=?", (fid,)).fetchone()
                 if cur is None:
