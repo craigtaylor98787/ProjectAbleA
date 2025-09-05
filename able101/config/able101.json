@@ -1,0 +1,5 @@
+{
+  "database_path": "/mnt/able101_usb/database/able101.sqlite",
+  "league_allowlist_path": "/mnt/able101_usb/config/league_allowlist.txt",
+  "days_ahead": 7
+}
