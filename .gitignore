@@ -7,3 +7,5 @@ venv/
 *.db
 logs/
 *.log
+
+able101/config/.env

@@ -1,0 +1,2 @@
+# One league id per line
+39
